@@ -12,8 +12,8 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/golang/glog"
-	"github.com/osrg/gobgp/config"
-	gobgp "github.com/osrg/gobgp/server"
+	"github.com/osrg/gobgp/pkg/config"
+	gobgp "github.com/osrg/gobgp/pkg/server"
 	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 )

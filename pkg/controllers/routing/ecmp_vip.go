@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/golang/glog"
-	"github.com/osrg/gobgp/packet/bgp"
-	"github.com/osrg/gobgp/table"
+	"github.com/osrg/gobgp/pkg/packet/bgp"
+	"github.com/osrg/gobgp/internal/pkg/table"
 	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 )

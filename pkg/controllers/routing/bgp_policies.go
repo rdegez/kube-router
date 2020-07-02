@@ -6,8 +6,8 @@ import (
 	"github.com/golang/glog"
 
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
-	"github.com/osrg/gobgp/config"
-	"github.com/osrg/gobgp/table"
+	"github.com/osrg/gobgp/pkg/config"
+	"github.com/osrg/gobgp/internal/pkg/table"
 	v1core "k8s.io/api/core/v1"
 )
 
