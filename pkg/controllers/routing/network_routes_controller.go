@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -19,11 +20,12 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/golang/glog"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
 	bgpapi "github.com/osrg/gobgp/api"
+	gobgpapi "github.com/osrg/gobgp/api"
 	"github.com/osrg/gobgp/pkg/config"
-	"github.com/osrg/gobgp/pkg/packet/bgp"
 	gobgp "github.com/osrg/gobgp/pkg/server"
-	"github.com/osrg/gobgp/internal/pkg/table"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
@@ -83,7 +85,7 @@ type NetworkRoutingController struct {
 	advertisePodCidr               bool
 	defaultNodeAsnNumber           uint32
 	nodeAsnNumber                  uint32
-	globalPeerRouters              []*config.Neighbor
+	globalPeerRouters              []*gobgpapi.Peer
 	nodePeerRouters                []string
 	enableCNI                      bool
 	bgpFullMeshMode                bool
@@ -96,7 +98,7 @@ type NetworkRoutingController struct {
 	peerMultihopTTL                uint8
 	MetricsEnabled                 bool
 	bgpServerStarted               bool
-	bgpPort                        uint16
+	bgpPort                        uint32
 	bgpRRClient                    bool
 	bgpRRServer                    bool
 	bgpClusterID                   uint32
@@ -244,7 +246,7 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 
 	nrc.bgpServerStarted = true
 	if !nrc.bgpGracefulRestart {
-		defer nrc.bgpServer.Shutdown()
+		defer nrc.bgpServer.StopBgp(context.Background(), &gobgpapi.StopBgpRequest{})
 	}
 
 	// loop forever till notified to stop on stopCh
@@ -362,42 +364,70 @@ func (nrc *NetworkRoutingController) advertisePodRoute() error {
 		metrics.ControllerBGPadvertisementsSent.Inc()
 	}
 
+	var err error
 	cidrStr := strings.Split(nrc.podCidr, "/")
 	subnet := cidrStr[0]
 	cidrLen, _ := strconv.Atoi(cidrStr[1])
 	if nrc.isIpv6 {
-		prefixes := []bgp.AddrPrefixInterface{bgp.NewIPv6AddrPrefix(uint8(cidrLen), subnet)}
-		attrs := []bgp.PathAttributeInterface{
-			bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP),
-			// This requires some research.
-			// For ipv6 what should be next-hop value? According to	 this https://www.noction.com/blog/bgp-next-hop
-			// using the link-local	 address may be more appropriate.
-			bgp.NewPathAttributeMpReachNLRI(nrc.nodeIP.String(), prefixes),
-		}
-
 		glog.V(2).Infof("Advertising route: '%s/%s via %s' to peers using attribute: %+q", subnet, strconv.Itoa(cidrLen), nrc.nodeIP.String(), attrs)
 
-		if _, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPv6AddrPrefix(uint8(cidrLen),
-			subnet), false, attrs, time.Now(), false)}); err != nil {
+		v6Family := &gobgpapi.Family{
+			Afi:  gobgpapi.Family_AFI_IP6,
+			Safi: gobgpapi.Family_SAFI_UNICAST,
+		}
+		nlri, _ := ptypes.MarshalAny(&gobgpapi.IPAddressPrefix{
+			PrefixLen: cidrLen,
+			Prefix:    cidrStr,
+		})
+		a1, _ := ptypes.MarshalAny(&api.OriginAttribute{
+			Origin: 0,
+		})
+		v6Attrs, _ := ptypes.MarshalAny(&gobgpapi.MpReachNLRIAttribute{
+			Family:   v6Family,
+			NextHops: []string{nrc.nodeIP.String()},
+			Nlris:    []*any.Any{nlri},
+		})
+		_, err := nrc.bgpServer.AddPath(context.Background(), &gobgpapi.AddPathRequest{
+			Path: &gobgpapi.Path{
+				Family: v6Family,
+				Nlri:   nlri,
+				Pattrs: []*any.Any{a1, v6Attrs},
+			},
+		})
+		if err != nil {
 			return fmt.Errorf(err.Error())
 		}
 	} else {
-		attrs := []bgp.PathAttributeInterface{
-			bgp.NewPathAttributeOrigin(0),
-			bgp.NewPathAttributeNextHop(nrc.nodeIP.String()),
-		}
 
 		glog.V(2).Infof("Advertising route: '%s/%s via %s' to peers", subnet, strconv.Itoa(cidrLen), nrc.nodeIP.String())
+		nlri, _ := ptypes.MarshalAny(&gobgpapi.IPAddressPrefix{
+			PrefixLen: cidrLen,
+			Prefix:    cidrStr,
+		})
 
-		if _, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(cidrLen),
-			subnet), false, attrs, time.Now(), false)}); err != nil {
+		a1, _ := ptypes.MarshalAny(&api.OriginAttribute{
+			Origin: 0,
+		})
+		a2, _ := ptypes.MarshalAny(&api.NextHopAttribute{
+			NextHop: nrc.nodeIP.String(),
+		})
+		attrs := []*any.Any{a1, a2}
+
+		_, err := nrc.bgpServer.AddPath(context.Background(), &gobgpapi.AddPathRequest{
+			Path: &gobgpapi.Path{
+				Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
+				Nlri:   nlri,
+				Pattrs: attrs,
+			},
+		})
+		if err != nil {
 			return fmt.Errorf(err.Error())
 		}
 	}
 	return nil
 }
 
-func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
+func (nrc *NetworkRoutingController) injectRoute(path *gobgpapi.Path) error {
 	nexthop := path.GetNexthop()
 	nlri := path.GetNlri()
 	dst, _ := netlink.ParseIPNet(nlri.String())

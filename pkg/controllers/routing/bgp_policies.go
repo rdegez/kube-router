@@ -1,13 +1,15 @@
 package routing
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"github.com/golang/glog"
+	"strconv"
 
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
+	gobgpapi "github.com/osrg/gobgp/api"
 	"github.com/osrg/gobgp/pkg/config"
-	"github.com/osrg/gobgp/internal/pkg/table"
+
 	v1core "k8s.io/api/core/v1"
 )
 
@@ -20,50 +22,39 @@ func (nrc *NetworkRoutingController) AddPolicies() error {
 		return nil
 	}
 
-	// creates prefix set to represent the assigned node's pod CIDR
-	podCidrPrefixSet, err := table.NewPrefixSet(config.PrefixSet{
-		PrefixSetName: "podcidrprefixset",
-		PrefixList: []config.Prefix{
-			{
+	definedSet := &gobgpapi.DefinedSet{
+		DefinedType: gobgpapi.DefinedType_PREFIX,
+		Name:        "podcidrprefixset",
+		Prefixes: []*gobgpapi.Prefix{
+			&gobgpapi.Prefix{
 				IpPrefix: nrc.podCidr,
 			},
 		},
-	})
-	if err != nil {
-		return fmt.Errorf("Failed to create podCidrPrefixSet: %s", err)
 	}
 
-	err = nrc.bgpServer.ReplaceDefinedSet(podCidrPrefixSet)
-	if err != nil {
-		err2 := nrc.bgpServer.AddDefinedSet(podCidrPrefixSet)
-		if err2 != nil {
-			glog.Errorf("Failed to add podCidrPrefixSet: %s", err2)
-		}
+	err2 := nrc.bgpServer.AddDefinedSet(context.Background(), &gobgpapi.AddDefinedSetRequest{DefinedSet: definedSet})
+	if err2 != nil {
+		glog.Errorf("Failed to add podCidrPrefixSet: %s", err2)
 	}
 
 	// creates prefix set to represent all the advertisable IP associated with the services
-	advIPPrefixList := make([]config.Prefix, 0)
+	advIPPrefixList := make([]*gobgpapi.Prefix, 0)
 	advIps, _, _ := nrc.getAllVIPs()
 	for _, ip := range advIps {
-		advIPPrefixList = append(advIPPrefixList, config.Prefix{IpPrefix: ip + "/32"})
+		advIPPrefixList = append(advIPPrefixList, &gobgpapi.Prefix{IpPrefix: ip + "/32"})
 	}
-	clusterIPPrefixSet, err := table.NewPrefixSet(config.PrefixSet{
-		PrefixSetName: "clusteripprefixset",
-		PrefixList:    advIPPrefixList,
-	})
-	if err != nil {
-		return fmt.Errorf("Failed to create clusterIPPrefixSet: %s", err)
+	clusterIPPrefixSet := &gobgpapi.DefinedSet{
+		DefinedType: gobgpapi.DefinedType_PREFIX,
+		Name:        "clusteripprefixset",
+		Prefixes:    advIPPrefixList,
 	}
 
-	err = nrc.bgpServer.ReplaceDefinedSet(clusterIPPrefixSet)
-	if err != nil {
-		err2 := nrc.bgpServer.AddDefinedSet(clusterIPPrefixSet)
-		if err2 != nil {
-			glog.Errorf("Failed to add clusterIPPrefixSet: %s", err2)
-		}
+	err2 = nrc.bgpServer.AddDefinedSet(context.Background(), &gobgpapi.AddDefinedSetRequest{DefinedSet: clusterIPPrefixSet})
+	if err2 != nil {
+		glog.Errorf("Failed to add clusterIPPrefixSet: %s", err2)
 	}
 
-	iBGPPeers := make([]string, 0)
+	iBGPPeers := make([]*gobgpapi.Prefix, 0)
 	if nrc.bgpEnableInternal {
 		// Get the current list of the nodes from the local cache
 		nodes := nrc.nodeLister.List()
@@ -74,59 +65,56 @@ func (nrc *NetworkRoutingController) AddPolicies() error {
 				glog.Errorf("Failed to find a node IP and therefore cannot add internal BGP Peer: %v", err)
 				continue
 			}
-			iBGPPeers = append(iBGPPeers, nodeIP.String())
+			iBGPPeers = append(iBGPPeers, &gobgpapi.Prefix{IpPrefix: nodeIP.String()})
 		}
-		iBGPPeerNS, _ := table.NewNeighborSet(config.NeighborSet{
-			NeighborSetName:  "iBGPpeerset",
-			NeighborInfoList: iBGPPeers,
-		})
-		err := nrc.bgpServer.ReplaceDefinedSet(iBGPPeerNS)
-		if err != nil {
-			err2 := nrc.bgpServer.AddDefinedSet(iBGPPeerNS)
-			if err2 != nil {
-				glog.Errorf("Failed to add iBGPPeerNS: %s", err2)
-			}
+
+		iBGPPeerNS := &gobgpapi.DefinedSet{
+			DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+			Name:        "iBGPpeerset",
+			Prefixes:    iBGPPeers,
+		}
+		err2 := nrc.bgpServer.AddDefinedSet(context.Background(), &gobgpapi.AddDefinedSetRequest{DefinedSet: iBGPPeerNS})
+		if err2 != nil {
+			glog.Errorf("Failed to add iBGPPeerNS: %s", err2)
 		}
 	}
 
-	externalBgpPeers := make([]string, 0)
+	externalBgpPeers := make([]*gobgpapi.Prefix, 0)
 	if len(nrc.globalPeerRouters) > 0 {
 		for _, peer := range nrc.globalPeerRouters {
-			externalBgpPeers = append(externalBgpPeers, peer.Config.NeighborAddress)
+			externalBgpPeers = append(externalBgpPeers, &gobgpapi.Prefix{IpPrefix: peer.Conf.NeighborAddress})
 		}
 	}
 	if len(nrc.nodePeerRouters) > 0 {
-		externalBgpPeers = append(externalBgpPeers, nrc.nodePeerRouters...)
+		for _, peer := range nrc.nodePeerRouters {
+			externalBgpPeers = append(externalBgpPeers, &gobgpapi.Prefix{IpPrefix: peer})
+		}
 	}
 	if len(externalBgpPeers) > 0 {
-		ns, _ := table.NewNeighborSet(config.NeighborSet{
-			NeighborSetName:  "externalpeerset",
-			NeighborInfoList: externalBgpPeers,
-		})
-		err := nrc.bgpServer.ReplaceDefinedSet(ns)
-		if err != nil {
-			err2 := nrc.bgpServer.AddDefinedSet(ns)
-			if err2 != nil {
-				glog.Errorf("Failed to add ns: %s", err2)
-			}
+		eBGPPeerNS := &gobgpapi.DefinedSet{
+			DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+			Name:        "externalpeerset",
+			Prefixes:    externalBgpPeers,
+		}
+		err2 := nrc.bgpServer.AddDefinedSet(context.Background(), &gobgpapi.AddDefinedSetRequest{DefinedSet: eBGPPeerNS})
+		if err2 != nil {
+			glog.Errorf("Failed to add iBGPPeerNS: %s", err2)
 		}
 	}
 
 	// a slice of all peers is used as a match condition for reject statement of clusteripprefixset import polcy
 	allBgpPeers := append(externalBgpPeers, iBGPPeers...)
-	ns, _ := table.NewNeighborSet(config.NeighborSet{
-		NeighborSetName:  "allpeerset",
-		NeighborInfoList: allBgpPeers,
-	})
-	err = nrc.bgpServer.ReplaceDefinedSet(ns)
-	if err != nil {
-		err2 := nrc.bgpServer.AddDefinedSet(ns)
-		if err2 != nil {
-			glog.Errorf("Failed to add ns: %s", err2)
-		}
+	allPeerNS := &gobgpapi.DefinedSet{
+		DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+		Name:        "allpeerset",
+		Prefixes:    allBgpPeers,
+	}
+	err2 = nrc.bgpServer.AddDefinedSet(context.Background(), &gobgpapi.AddDefinedSetRequest{DefinedSet: allPeerNS})
+	if err2 != nil {
+		glog.Errorf("Failed to add ns: %s", err2)
 	}
 
-	err = nrc.addExportPolicies()
+	err := nrc.addExportPolicies()
 	if err != nil {
 		return err
 	}
@@ -154,132 +142,138 @@ func (nrc *NetworkRoutingController) AddPolicies() error {
 //   iBGP peers
 // - an option to allow overriding the next-hop-address with the outgoing ip for external bgp peers
 func (nrc *NetworkRoutingController) addExportPolicies() error {
-	statements := make([]config.Statement, 0)
+	statements := make([]*gobgpapi.Statement, 0)
 
-	var bgpActions config.BgpActions
+	var bgpActions gobgpapi.Actions
 	if nrc.pathPrepend {
-		bgpActions = config.BgpActions{
-			SetAsPathPrepend: config.SetAsPathPrepend{
-				As:      nrc.pathPrependAS,
-				RepeatN: nrc.pathPrependCount,
+		prependAsn, err := strconv.ParseUint(nrc.pathPrependAS, 10, 32)
+		if err != nil {
+			return errors.New("Invalid value for kube-router.io/path-prepend.as: " + err.Error())
+		}
+		bgpActions = gobgpapi.Actions{
+			AsPrepend: &gobgpapi.AsPrependAction{
+				Asn:    uint32(prependAsn),
+				Repeat: uint32(nrc.pathPrependCount),
 			},
 		}
 	}
 
 	if nrc.bgpEnableInternal {
-		actions := config.Actions{
-			RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
+		actions := gobgpapi.Actions{
+			RouteAction: gobgpapi.RouteAction_ACCEPT,
 		}
 		if nrc.overrideNextHop {
-			actions.BgpActions.SetNextHop = "self"
+			actions.Nexthop = &gobgpapi.NexthopAction{Self: true}
 		}
 		// statement to represent the export policy to permit advertising node's pod CIDR
 		statements = append(statements,
-			config.Statement{
-				Conditions: config.Conditions{
-					MatchPrefixSet: config.MatchPrefixSet{
-						PrefixSet: "podcidrprefixset",
+			&gobgpapi.Statement{
+				Conditions: &gobgpapi.Conditions{
+					PrefixSet: &gobgpapi.MatchSet{
+						MatchType: gobgpapi.MatchType_ANY,
+						Name:      "podcidrprefixset",
 					},
-					MatchNeighborSet: config.MatchNeighborSet{
-						NeighborSet: "iBGPpeerset",
+					NeighborSet: &gobgpapi.MatchSet{
+						MatchType: gobgpapi.MatchType_ANY,
+						Name:      "iBGPpeerset",
 					},
 				},
-				Actions: actions,
+				Actions: &actions,
 			})
 	}
 
 	if len(nrc.globalPeerRouters) > 0 || len(nrc.nodePeerRouters) > 0 {
-		if nrc.overrideNextHop {
-			bgpActions.SetNextHop = "self"
+		actions := gobgpapi.Actions{
+			RouteAction: gobgpapi.RouteAction_ACCEPT,
 		}
+		if nrc.overrideNextHop {
+			actions.Nexthop = &gobgpapi.NexthopAction{Self: true}
+		}
+
 		// statement to represent the export policy to permit advertising cluster IP's
 		// only to the global BGP peer or node specific BGP peer
-		statements = append(statements, config.Statement{
-			Conditions: config.Conditions{
-				MatchPrefixSet: config.MatchPrefixSet{
-					PrefixSet: "clusteripprefixset",
+		statements = append(statements, &gobgpapi.Statement{
+			Conditions: &gobgpapi.Conditions{
+				PrefixSet: &gobgpapi.MatchSet{
+					MatchType: gobgpapi.MatchType_ANY,
+					Name:      "clusteripprefixset",
 				},
-				MatchNeighborSet: config.MatchNeighborSet{
-					NeighborSet: "externalpeerset",
+				NeighborSet: &gobgpapi.MatchSet{
+					MatchType: gobgpapi.MatchType_ANY,
+					Name:      "externalpeerset",
 				},
 			},
-			Actions: config.Actions{
-				RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
-				BgpActions:       bgpActions,
-			},
+			Actions: &actions,
 		})
+
 		if nrc.advertisePodCidr {
-			actions := config.Actions{
-				RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
+			actions := gobgpapi.Actions{
+				RouteAction: gobgpapi.RouteAction_ACCEPT,
 			}
 			if nrc.overrideNextHop {
-				actions.BgpActions.SetNextHop = "self"
+				actions.Nexthop = &gobgpapi.NexthopAction{Self: true}
 			}
-			statements = append(statements, config.Statement{
-				Conditions: config.Conditions{
-					MatchPrefixSet: config.MatchPrefixSet{
-						PrefixSet: "podcidrprefixset",
+			statements = append(statements, &gobgpapi.Statement{
+				Conditions: &gobgpapi.Conditions{
+					PrefixSet: &gobgpapi.MatchSet{
+						MatchType: gobgpapi.MatchType_ANY,
+						Name:      "podcidrprefixset",
 					},
-					MatchNeighborSet: config.MatchNeighborSet{
-						NeighborSet: "externalpeerset",
+					NeighborSet: &gobgpapi.MatchSet{
+						MatchType: gobgpapi.MatchType_ANY,
+						Name:      "externalpeerset",
 					},
 				},
-				Actions: actions,
+				Actions: &actions,
 			})
 		}
 	}
 
-	definition := config.PolicyDefinition{
+	definition := gobgpapi.Policy{
 		Name:       "kube_router_export",
 		Statements: statements,
 	}
 
-	policy, err := table.NewPolicy(definition)
-	if err != nil {
-		return errors.New("Failed to create new policy: " + err.Error())
-	}
-
 	policyAlreadyExists := false
-	policyList := nrc.bgpServer.GetPolicy()
-	for _, existingPolicy := range policyList {
+	checkExistingPolicy := func(existingPolicy *gobgpapi.Policy) {
 		if existingPolicy.Name == "kube_router_export" {
 			policyAlreadyExists = true
 		}
 	}
+	err := nrc.bgpServer.ListPolicy(context.Background(), &gobgpapi.ListPolicyRequest{}, checkExistingPolicy)
+	if err != nil {
+		return errors.New("Failed to verify if kube-router BGP export policy exists: " + err.Error())
+	}
 
 	if !policyAlreadyExists {
-		err = nrc.bgpServer.AddPolicy(policy, false)
+		err = nrc.bgpServer.AddPolicy(context.Background(), &gobgpapi.AddPolicyRequest{Policy: &definition})
 		if err != nil {
 			return errors.New("Failed to add policy: " + err.Error())
 		}
 	}
 
 	policyAssignmentExists := false
-	_, existingPolicyAssignments, err := nrc.bgpServer.GetPolicyAssignment("", table.POLICY_DIRECTION_EXPORT)
-	if err == nil {
-		for _, existingPolicyAssignment := range existingPolicyAssignments {
-			if existingPolicyAssignment.Name == "kube_router_export" {
-				policyAssignmentExists = true
-			}
+	checkExistingPolicyAssignment := func(existingPolicyAssignment *gobgpapi.PolicyAssignment) {
+		if existingPolicyAssignment.Name == "kube_router_export" {
+			policyAssignmentExists = true
 		}
 	}
+	err = nrc.bgpServer.ListPolicyAssignment(context.Background(),
+		&gobgpapi.ListPolicyAssignmentRequest{Name: "kube_router_export", Direction: gobgpapi.PolicyDirection_EXPORT}, checkExistingPolicyAssignment)
+	if err == nil {
+		return errors.New("Failed to verify if kube-router BGP export policy assignment exists: " + err.Error())
+	}
 
+	policyAssignment := gobgpapi.PolicyAssignment{
+		Name:          "kube_router_export",
+		Direction:     gobgpapi.PolicyDirection_EXPORT,
+		Policies:      []*gobgpapi.Policy{&definition},
+		DefaultAction: gobgpapi.RouteAction_REJECT,
+	}
 	if !policyAssignmentExists {
-		err = nrc.bgpServer.AddPolicyAssignment("",
-			table.POLICY_DIRECTION_EXPORT,
-			[]*config.PolicyDefinition{&definition},
-			table.ROUTE_TYPE_REJECT)
+		err = nrc.bgpServer.AddPolicyAssignment(context.Background(), &gobgpapi.AddPolicyAssignmentRequest{Assignment: &policyAssignment})
 		if err != nil {
 			return errors.New("Failed to add policy assignment: " + err.Error())
-		}
-	} else {
-		// configure default BGP export policy to reject
-		err = nrc.bgpServer.ReplacePolicyAssignment("",
-			table.POLICY_DIRECTION_EXPORT,
-			[]*config.PolicyDefinition{&definition},
-			table.ROUTE_TYPE_REJECT)
-		if err != nil {
-			return errors.New("Failed to replace policy assignment: " + err.Error())
 		}
 	}
 
@@ -289,73 +283,70 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 // BGP import policies are added so that the following conditions are met:
 // - do not import Service VIPs advertised from any peers, instead each kube-router originates and injects Service VIPs into local rib.
 func (nrc *NetworkRoutingController) addImportPolicies() error {
-	statements := make([]config.Statement, 0)
+	statements := make([]*gobgpapi.Statement, 0)
 
-	statements = append(statements, config.Statement{
-		Conditions: config.Conditions{
-			MatchPrefixSet: config.MatchPrefixSet{
-				PrefixSet: "clusteripprefixset",
+	actions := gobgpapi.Actions{
+		RouteAction: gobgpapi.RouteAction_REJECT,
+	}
+	statements = append(statements, &gobgpapi.Statement{
+		Conditions: &gobgpapi.Conditions{
+			PrefixSet: &gobgpapi.MatchSet{
+				MatchType: gobgpapi.MatchType_ANY,
+				Name:      "clusteripprefixset",
 			},
-			MatchNeighborSet: config.MatchNeighborSet{
-				NeighborSet: "allpeerset",
+			NeighborSet: &gobgpapi.MatchSet{
+				MatchType: gobgpapi.MatchType_ANY,
+				Name:      "allpeerset",
 			},
 		},
-		Actions: config.Actions{
-			RouteDisposition: config.ROUTE_DISPOSITION_REJECT_ROUTE,
-		},
+		Actions: &actions,
 	})
 
-	definition := config.PolicyDefinition{
+	definition := gobgpapi.Policy{
 		Name:       "kube_router_import",
 		Statements: statements,
 	}
 
-	policy, err := table.NewPolicy(definition)
-	if err != nil {
-		return errors.New("Failed to create new policy: " + err.Error())
-	}
-
 	policyAlreadyExists := false
-	policyList := nrc.bgpServer.GetPolicy()
-	for _, existingPolicy := range policyList {
+	checkExistingPolicy := func(existingPolicy *gobgpapi.Policy) {
 		if existingPolicy.Name == "kube_router_import" {
 			policyAlreadyExists = true
 		}
 	}
+	err := nrc.bgpServer.ListPolicy(context.Background(), &gobgpapi.ListPolicyRequest{}, checkExistingPolicy)
+	if err != nil {
+		return errors.New("Failed to verify if kube-router BGP import policy exists: " + err.Error())
+	}
 
 	if !policyAlreadyExists {
-		err = nrc.bgpServer.AddPolicy(policy, false)
+		err = nrc.bgpServer.AddPolicy(context.Background(), &gobgpapi.AddPolicyRequest{Policy: &definition})
 		if err != nil {
 			return errors.New("Failed to add policy: " + err.Error())
 		}
 	}
 
 	policyAssignmentExists := false
-	_, existingPolicyAssignments, err := nrc.bgpServer.GetPolicyAssignment("", table.POLICY_DIRECTION_IMPORT)
-	if err == nil {
-		for _, existingPolicyAssignment := range existingPolicyAssignments {
-			if existingPolicyAssignment.Name == "kube_router_import" {
-				policyAssignmentExists = true
-			}
+	checkExistingPolicyAssignment := func(existingPolicyAssignment *gobgpapi.PolicyAssignment) {
+		if existingPolicyAssignment.Name == "kube_router_import" {
+			policyAssignmentExists = true
 		}
 	}
+	err = nrc.bgpServer.ListPolicyAssignment(context.Background(),
+		&gobgpapi.ListPolicyAssignmentRequest{Name: "kube_router_export", Direction: gobgpapi.PolicyDirection_EXPORT}, checkExistingPolicyAssignment)
+	if err == nil {
+		return errors.New("Failed to verify if kube-router BGP import policy assignment exists: " + err.Error())
+	}
 
-	// Default policy is to accept
+	policyAssignment := gobgpapi.PolicyAssignment{
+		Name:          "kube_router_import",
+		Direction:     gobgpapi.PolicyDirection_IMPORT,
+		Policies:      []*gobgpapi.Policy{&definition},
+		DefaultAction: gobgpapi.RouteAction_ACCEPT,
+	}
 	if !policyAssignmentExists {
-		err = nrc.bgpServer.AddPolicyAssignment("",
-			table.POLICY_DIRECTION_IMPORT,
-			[]*config.PolicyDefinition{&definition},
-			table.ROUTE_TYPE_ACCEPT)
+		err = nrc.bgpServer.AddPolicyAssignment(context.Background(), &gobgpapi.AddPolicyAssignmentRequest{Assignment: &policyAssignment})
 		if err != nil {
 			return errors.New("Failed to add policy assignment: " + err.Error())
-		}
-	} else {
-		err = nrc.bgpServer.ReplacePolicyAssignment("",
-			table.POLICY_DIRECTION_IMPORT,
-			[]*config.PolicyDefinition{&definition},
-			table.ROUTE_TYPE_ACCEPT)
-		if err != nil {
-			return errors.New("Failed to replace policy assignment: " + err.Error())
 		}
 	}
 
