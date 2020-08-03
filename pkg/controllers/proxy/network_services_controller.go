@@ -1309,7 +1309,11 @@ func (nsc *NetworkServicesController) syncHairpinIptablesRules() error {
 				// Handle ClusterIP Service
 				rule, ruleArgs := hairpinRuleFrom(svcInfo.clusterIP.String(), ep.ip, svcInfo.port)
 				rulesNeeded[rule] = ruleArgs
-
+				// Handle ExternalIPs if any
+				for _, extip := range svcInfo.externalIPs {
+					rule, ruleArgs := hairpinRuleFrom(extip.String(), ep.ip, svcInfo.port)
+					rulesNeeded[rule] = ruleArgs
+				}
 				// Handle NodePort Service
 				if svcInfo.nodePort != 0 {
 					rule, ruleArgs := hairpinRuleFrom(nsc.nodeIP.String(), ep.ip, svcInfo.nodePort)
